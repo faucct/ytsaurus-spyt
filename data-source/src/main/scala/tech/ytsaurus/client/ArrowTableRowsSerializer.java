@@ -8,9 +8,7 @@ import org.apache.arrow.vector.*;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.MapVector;
 import org.apache.arrow.vector.complex.StructVector;
-import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.ipc.WriteChannel;
-import org.apache.arrow.vector.ipc.message.IpcOption;
 import org.apache.arrow.vector.ipc.message.MessageSerializer;
 import org.apache.arrow.vector.types.DateUnit;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
@@ -1202,11 +1200,12 @@ public class ArrowTableRowsSerializer<Row> implements TableRowsSerializer<Row>, 
                 return InputStream.nullInputStream();
             }
             var byteBuf = Unpooled.buffer();
+            int mergedRowSizeIndex = byteBuf.writerIndex();
+            byteBuf.writeLongLE(0);  // reserve space
             var writeChannel = new WriteChannel(new ByteBufWritableByteChannel(byteBuf));
-            MessageSerializer.serialize(writeChannel, schema);
             writeChannel.write(serializedRows.nioBuffer());
             this.serializedRows = Unpooled.buffer();
-            ArrowStreamWriter.writeEndOfStream(writeChannel, new IpcOption());
+            byteBuf.setLongLE(mergedRowSizeIndex, byteBuf.writerIndex() - mergedRowSizeIndex - 8);
             return new ByteBufInputStream(byteBuf);
         } catch (IOException e) {
             throw new RuntimeException(e);
@@ -1218,37 +1217,7 @@ public class ArrowTableRowsSerializer<Row> implements TableRowsSerializer<Row>, 
         if (serializedRows.readableBytes() == 0) {
             return 0;
         }
-        try {
-            return serializedRows.readableBytes() + new WritableByteChannel() {
-                int size = 0;
-
-                {
-                    var writeChannel = new WriteChannel(this);
-                    MessageSerializer.serialize(writeChannel, schema);
-                    ArrowStreamWriter.writeEndOfStream(writeChannel, new IpcOption());
-                }
-
-                @Override
-                public int write(ByteBuffer src) {
-                    int written = src.remaining();
-                    size += written;
-                    src.position(src.position() + written);
-                    return written;
-                }
-
-                @Override
-                public boolean isOpen() {
-                    return true;
-                }
-
-                @Override
-                public void close() {
-
-                }
-            }.size;
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
+        return serializedRows.readableBytes() + Long.BYTES;
     }
 
     @Override
