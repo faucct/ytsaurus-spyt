@@ -1,6 +1,8 @@
 package tech.ytsaurus.client;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufInputStream;
+import io.netty.buffer.Unpooled;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.*;
 import org.apache.arrow.vector.complex.ListVector;
@@ -18,19 +20,21 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import tech.ytsaurus.rpcproxy.ERowsetFormat;
+import tech.ytsaurus.rpcproxy.TRowsetDescriptor;
 import tech.ytsaurus.spyt.format.batch.ArrowUtils;
 import tech.ytsaurus.typeinfo.DecimalType;
 import tech.ytsaurus.yson.YsonBinaryWriter;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-public class ArrowTableRowsSerializer<Row> extends TableRowsSerializerBase<Row> implements AutoCloseable {
+public class ArrowTableRowsSerializer<Row> implements TableRowsSerializer<Row>, AutoCloseable {
     private static abstract class ArrowGetterFromStruct<Row> {
         public final Field field;
         public final ArrowType arrowType;
@@ -1145,9 +1149,12 @@ public class ArrowTableRowsSerializer<Row> extends TableRowsSerializerBase<Row> 
     private final Schema schema;
     private final BufferAllocator allocator =
             ArrowUtils.rootAllocator().newChildAllocator("toBatchIterator", 0, Long.MAX_VALUE);
+    private final TRowsetDescriptor rowsetDescriptor;
+    private ByteBuf serializedRows;
 
     public ArrowTableRowsSerializer(java.util.List<? extends Map.Entry<String, ? extends YTGetters.FromStruct<Row>>> structsGetter) {
-        super(ERowsetFormat.RF_FORMAT);
+        this.rowsetDescriptor = TRowsetDescriptor.newBuilder().setRowsetFormat(ERowsetFormat.RF_FORMAT).build();
+        this.serializedRows = Unpooled.buffer();
         fieldGetters = structsGetter.stream().map(memberGetter -> arrowGetter(
                 memberGetter.getKey(), memberGetter.getValue()
         )).collect(Collectors.toList());
@@ -1184,19 +1191,35 @@ public class ArrowTableRowsSerializer<Row> extends TableRowsSerializerBase<Row> 
     }
 
     @Override
-    protected void writeMeta(ByteBuf buf) {
+    public TRowsetDescriptor getRowsetDescriptor() {
+        return rowsetDescriptor;
+    }
+
+    @Override
+    public InputStream flush() {
         try {
-            MessageSerializer.serialize(new WriteChannel(new ByteBufWritableByteChannel(buf)), schema);
-            ArrowStreamWriter.writeEndOfStream(new WriteChannel(new ByteBufWritableByteChannel(serializedRows)), new IpcOption());
+            if (serializedRows.readableBytes() == 0) {
+                return InputStream.nullInputStream();
+            }
+            var byteBuf = Unpooled.buffer();
+            var writeChannel = new WriteChannel(new ByteBufWritableByteChannel(byteBuf));
+            MessageSerializer.serialize(writeChannel, schema);
+            writeChannel.write(serializedRows.nioBuffer());
+            this.serializedRows = Unpooled.buffer();
+            ArrowStreamWriter.writeEndOfStream(writeChannel, new IpcOption());
+            return new ByteBufInputStream(byteBuf);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
     @Override
-    protected int getMetaSize() {
+    public int size() {
+        if (serializedRows.readableBytes() == 0) {
+            return 0;
+        }
         try {
-            return new WritableByteChannel() {
+            return serializedRows.readableBytes() + new WritableByteChannel() {
                 int size = 0;
 
                 {
