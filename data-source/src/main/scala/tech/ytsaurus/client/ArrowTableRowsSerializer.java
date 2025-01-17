@@ -18,7 +18,6 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import tech.ytsaurus.rpcproxy.ERowsetFormat;
-import tech.ytsaurus.rpcproxy.TRowsetDescriptor;
 import tech.ytsaurus.spyt.format.batch.ArrowUtils;
 import tech.ytsaurus.typeinfo.DecimalType;
 import tech.ytsaurus.yson.YsonBinaryWriter;
@@ -31,7 +30,7 @@ import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-public class ArrowTableRowsSerializer<Row> extends TableRowsSerializer<Row> implements AutoCloseable {
+public class ArrowTableRowsSerializer<Row> extends TableRowsSerializerBase<Row> implements AutoCloseable {
     private static abstract class ArrowGetterFromStruct<Row> {
         public final Field field;
         public final ArrowType arrowType;
@@ -1185,28 +1184,54 @@ public class ArrowTableRowsSerializer<Row> extends TableRowsSerializer<Row> impl
     }
 
     @Override
-    protected void writeMeta(ByteBuf buf, ByteBuf serializedRows, int rowsCount) {
+    protected void writeMeta(ByteBuf buf) {
         try {
-            var writeChannel = new WriteChannel(new ByteBufWritableByteChannel(buf));
-            MessageSerializer.serialize(writeChannel, schema);
-            writeChannel.write(serializedRows.nioBuffer());
-            ArrowStreamWriter.writeEndOfStream(writeChannel, new IpcOption());
+            MessageSerializer.serialize(new WriteChannel(new ByteBufWritableByteChannel(buf)), schema);
+            ArrowStreamWriter.writeEndOfStream(new WriteChannel(new ByteBufWritableByteChannel(serializedRows)), new IpcOption());
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
     @Override
-    protected void writeRowsWithoutCount(
-            ByteBuf buf, TRowsetDescriptor descriptor, java.util.List<Row> rows, int[] idMapping
-    ) {
-        writeRows(buf, descriptor, rows, idMapping);
+    protected int getMetaSize() {
+        try {
+            return new WritableByteChannel() {
+                int size = 0;
+
+                {
+                    var writeChannel = new WriteChannel(this);
+                    MessageSerializer.serialize(writeChannel, schema);
+                    ArrowStreamWriter.writeEndOfStream(writeChannel, new IpcOption());
+                }
+
+                @Override
+                public int write(ByteBuffer src) {
+                    int written = src.remaining();
+                    size += written;
+                    src.position(src.position() + written);
+                    return written;
+                }
+
+                @Override
+                public boolean isOpen() {
+                    return true;
+                }
+
+                @Override
+                public void close() {
+
+                }
+            }.size;
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     @Override
-    protected void writeRows(ByteBuf buf, TRowsetDescriptor descriptor, java.util.List<Row> rows, int[] idMapping) {
+    public void write(java.util.List<Row> rows) {
         try {
-            var writeChannel = new WriteChannel(new ByteBufWritableByteChannel(buf));
+            var writeChannel = new WriteChannel(new ByteBufWritableByteChannel(serializedRows));
             MessageSerializer.serialize(writeChannel, schema);
             try (var root = VectorSchemaRoot.create(schema, allocator)) {
                 var unloader = new VectorUnloader(root);
