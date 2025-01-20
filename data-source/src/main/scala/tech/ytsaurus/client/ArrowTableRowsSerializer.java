@@ -1,7 +1,6 @@
 package tech.ytsaurus.client;
 
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufInputStream;
 import io.netty.buffer.Unpooled;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.*;
@@ -25,14 +24,13 @@ import tech.ytsaurus.yson.YsonBinaryWriter;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-public class ArrowTableRowsSerializer<Row> implements TableRowsSerializer<Row>, AutoCloseable {
+public class ArrowTableRowsSerializer<Row> extends TableRowsSerializerBase<Row> implements AutoCloseable {
     private static abstract class ArrowGetterFromStruct<Row> {
         public final Field field;
         public final ArrowType arrowType;
@@ -1147,11 +1145,9 @@ public class ArrowTableRowsSerializer<Row> implements TableRowsSerializer<Row>, 
     private final Schema schema;
     private final BufferAllocator allocator =
             ArrowUtils.rootAllocator().newChildAllocator("toBatchIterator", 0, Long.MAX_VALUE);
-    private final TRowsetDescriptor rowsetDescriptor;
-    private ByteBuf serializedRows;
 
     public ArrowTableRowsSerializer(java.util.List<? extends Map.Entry<String, ? extends YTGetters.FromStruct<Row>>> structsGetter) {
-        this.rowsetDescriptor = TRowsetDescriptor.newBuilder().setRowsetFormat(ERowsetFormat.RF_FORMAT).build();
+        super(ERowsetFormat.RF_FORMAT);
         this.serializedRows = Unpooled.buffer();
         fieldGetters = structsGetter.stream().map(memberGetter -> arrowGetter(
                 memberGetter.getKey(), memberGetter.getValue()
@@ -1194,22 +1190,13 @@ public class ArrowTableRowsSerializer<Row> implements TableRowsSerializer<Row>, 
     }
 
     @Override
-    public InputStream flush() {
-        try {
-            if (serializedRows.readableBytes() == 0) {
-                return InputStream.nullInputStream();
-            }
-            var byteBuf = Unpooled.buffer();
-            int mergedRowSizeIndex = byteBuf.writerIndex();
-            byteBuf.writeLongLE(0);  // reserve space
-            var writeChannel = new WriteChannel(new ByteBufWritableByteChannel(byteBuf));
-            writeChannel.write(serializedRows.nioBuffer());
-            this.serializedRows = Unpooled.buffer();
-            byteBuf.setLongLE(mergedRowSizeIndex, byteBuf.writerIndex() - mergedRowSizeIndex - 8);
-            return new ByteBufInputStream(byteBuf);
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
+    protected void writeMeta(ByteBuf buf) {
+        buf.writeLongLE(serializedRows.readableBytes());
+    }
+
+    @Override
+    protected int getMetaSize() {
+        return Long.BYTES;
     }
 
     @Override
