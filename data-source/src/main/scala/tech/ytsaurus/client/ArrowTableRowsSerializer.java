@@ -1,14 +1,13 @@
 package tech.ytsaurus.client;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.*;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.MapVector;
 import org.apache.arrow.vector.complex.StructVector;
-import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.ipc.WriteChannel;
-import org.apache.arrow.vector.ipc.message.IpcOption;
 import org.apache.arrow.vector.ipc.message.MessageSerializer;
 import org.apache.arrow.vector.types.DateUnit;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
@@ -31,7 +30,7 @@ import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-public class ArrowTableRowsSerializer<Row> extends TableRowsSerializer<Row> implements AutoCloseable {
+public class ArrowTableRowsSerializer<Row> extends TableRowsSerializerBase<Row> implements AutoCloseable {
     private static abstract class ArrowGetterFromStruct<Row> {
         public final Field field;
         public final ArrowType arrowType;
@@ -1149,6 +1148,7 @@ public class ArrowTableRowsSerializer<Row> extends TableRowsSerializer<Row> impl
 
     public ArrowTableRowsSerializer(java.util.List<? extends Map.Entry<String, ? extends YTGetters.FromStruct<Row>>> structsGetter) {
         super(ERowsetFormat.RF_FORMAT);
+        this.serializedRows = Unpooled.buffer();
         fieldGetters = structsGetter.stream().map(memberGetter -> arrowGetter(
                 memberGetter.getKey(), memberGetter.getValue()
         )).collect(Collectors.toList());
@@ -1185,28 +1185,32 @@ public class ArrowTableRowsSerializer<Row> extends TableRowsSerializer<Row> impl
     }
 
     @Override
-    protected void writeMeta(ByteBuf buf, ByteBuf serializedRows, int rowsCount) {
-        try {
-            var writeChannel = new WriteChannel(new ByteBufWritableByteChannel(buf));
-            MessageSerializer.serialize(writeChannel, schema);
-            writeChannel.write(serializedRows.nioBuffer());
-            ArrowStreamWriter.writeEndOfStream(writeChannel, new IpcOption());
-        } catch (IOException e) {
-            throw new RuntimeException(e);
+    public TRowsetDescriptor getRowsetDescriptor() {
+        return rowsetDescriptor;
+    }
+
+    @Override
+    protected void writeMeta(ByteBuf buf) {
+        buf.writeLongLE(serializedRows.readableBytes());
+    }
+
+    @Override
+    protected int getMetaSize() {
+        return Long.BYTES;
+    }
+
+    @Override
+    public int size() {
+        if (serializedRows.readableBytes() == 0) {
+            return 0;
         }
+        return serializedRows.readableBytes() + Long.BYTES;
     }
 
     @Override
-    protected void writeRowsWithoutCount(
-            ByteBuf buf, TRowsetDescriptor descriptor, java.util.List<Row> rows, int[] idMapping
-    ) {
-        writeRows(buf, descriptor, rows, idMapping);
-    }
-
-    @Override
-    protected void writeRows(ByteBuf buf, TRowsetDescriptor descriptor, java.util.List<Row> rows, int[] idMapping) {
+    public void write(java.util.List<Row> rows) {
         try {
-            var writeChannel = new WriteChannel(new ByteBufWritableByteChannel(buf));
+            var writeChannel = new WriteChannel(new ByteBufWritableByteChannel(serializedRows));
             MessageSerializer.serialize(writeChannel, schema);
             try (var root = VectorSchemaRoot.create(schema, allocator)) {
                 var unloader = new VectorUnloader(root);
